@@ -7,6 +7,7 @@ import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.core.JsonValue;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,64 +60,76 @@ public class Main {
                 .baseUrl(baseUrl)
                 .build();
 
-        // Advertise the Read tool to the LLM.
-        ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
+        // Maintain conversation history across iterations.
+        ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
                 .model("anthropic/claude-haiku-4.5")
                 .addUserMessage(prompt)
                 .putAdditionalBodyProperty(
                         "tools",
-                        JsonValue.from(List.of(readTool())))
-                .build();
+                        JsonValue.from(List.of(readTool())));
 
-        // Send request.
-        ChatCompletion response = client.chat().completions().create(params);
+        // Agent loop.
+        while (true) {
 
-        if (response.choices().isEmpty()) {
-            throw new RuntimeException("No choices in response");
+            ChatCompletion response = client.chat().completions().create(
+                    paramsBuilder.build());
+
+            if (response.choices().isEmpty()) {
+                throw new RuntimeException("No choices in response");
+            }
+
+            var message = response.choices().get(0).message();
+
+            // Record the assistant response in conversation history.
+            paramsBuilder.addMessage(message);
+
+            var toolCalls = message.toolCalls().orElse(List.of());
+
+            // No tool calls: this is the final response.
+            if (toolCalls.isEmpty()) {
+                System.out.print(message.content().orElse(""));
+                return;
+            }
+
+            // Execute every tool call returned in this response.
+            for (var toolCall : toolCalls) {
+
+                var function = toolCall.function();
+                String toolName = function.name();
+
+                if (!"Read".equals(toolName)) {
+                    throw new IllegalArgumentException(
+                            "Unknown tool: " + toolName);
+                }
+
+                // Parse arguments.
+                JsonNode arguments = MAPPER.readTree(
+                        function.arguments());
+
+                JsonNode filePathNode = arguments.get("file_path");
+
+                if (filePathNode == null ||
+                        !filePathNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Missing or invalid file_path argument");
+                }
+
+                String filePath = filePathNode.asText();
+
+                // Execute Read tool.
+                String result = Files.readString(
+                        Path.of(filePath));
+
+                // Send tool result back to the model.
+                paramsBuilder.addMessage(
+                        ChatCompletionToolMessageParam.builder()
+                                .toolCallId(toolCall.id())
+                                .content(result)
+                                .build());
+            }
+
+            // Continue loop.
+            // The model receives the tool results in the next request.
         }
-
-        var message = response.choices().get(0).message();
-
-        // Check whether the model requested a tool call.
-        var toolCalls = message.toolCalls().orElse(List.of());
-
-        if (toolCalls.isEmpty()) {
-            // Normal text response.
-            System.out.print(message.content().orElse(""));
-            return;
-        }
-
-        // Execute only the first tool call.
-        // var toolCall = toolCalls.get(0).asFunction();
-        // var function = toolCall.function();
-
-        var toolCall = toolCalls.get(0);
-        var function = toolCall.function();
-        String toolName = function.name();
-
-        if (!"Read".equals(toolName)) {
-            throw new IllegalArgumentException(
-                    "Unknown tool: " + toolName);
-        }
-
-        // Parse tool arguments.
-        JsonNode arguments = MAPPER.readTree(
-                function.arguments());
-
-        JsonNode filePathNode = arguments.get("file_path");
-
-        if (filePathNode == null || !filePathNode.isTextual()) {
-            throw new IllegalArgumentException(
-                    "Missing or invalid file_path argument");
-        }
-
-        String filePath = filePathNode.asText();
-
-        // Execute Read.
-        String contents = Files.readString(
-                Path.of(filePath));
-
-        // Output exact file contents.
-        System.out.print(contents);
     }
 }
