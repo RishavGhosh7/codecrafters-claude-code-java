@@ -29,9 +29,81 @@ public class Main {
                                 "properties", Map.of(
                                         "file_path", Map.of(
                                                 "type", "string",
-                                                "description",
-                                                "The path to the file to read")),
+                                                "description", "The path to the file to read")),
                                 "required", List.of("file_path"))));
+    }
+
+    private static Map<String, Object> writeTool() {
+        return Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Write",
+                        "description", "Write content to a file",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "file_path", Map.of(
+                                                "type", "string",
+                                                "description", "The path of the file to write to"),
+                                        "content", Map.of(
+                                                "type", "string",
+                                                "description", "The content to write to the file")),
+                                "required", List.of("file_path", "content"))));
+    }
+
+    private static String executeTool(
+            String toolName,
+            String argumentsJson) throws Exception {
+
+        JsonNode arguments = MAPPER.readTree(argumentsJson);
+
+        JsonNode pathNode = arguments.get("file_path");
+
+        if (pathNode == null || !pathNode.isTextual()) {
+            throw new IllegalArgumentException(
+                    "Missing or invalid file_path");
+        }
+
+        String filePath = pathNode.asText();
+
+        if (filePath.isBlank()) {
+            throw new IllegalArgumentException("file_path cannot be empty");
+        }
+
+        Path path = Path.of(filePath);
+
+        switch (toolName) {
+
+            case "Read": {
+                return Files.readString(path);
+            }
+
+            case "Write": {
+                JsonNode contentNode = arguments.get("content");
+
+                if (contentNode == null || !contentNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Missing or invalid content");
+                }
+
+                String content = contentNode.asText();
+
+                Path parent = path.toAbsolutePath().getParent();
+
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+
+                // Creates the file if missing and overwrites if present.
+                Files.writeString(path, content);
+
+                return "File written successfully.";
+            }
+
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown tool: " + toolName);
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -60,15 +132,18 @@ public class Main {
                 .baseUrl(baseUrl)
                 .build();
 
-        // Maintain conversation history across iterations.
+        List<Map<String, Object>> tools = List.of(
+                readTool(),
+                writeTool());
+
         ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
                 .model("anthropic/claude-haiku-4.5")
                 .addUserMessage(prompt)
                 .putAdditionalBodyProperty(
                         "tools",
-                        JsonValue.from(List.of(readTool())));
+                        JsonValue.from(tools));
 
-        // Agent loop.
+        // Agent loop
         while (true) {
 
             ChatCompletion response = client.chat().completions().create(
@@ -80,56 +155,35 @@ public class Main {
 
             var message = response.choices().get(0).message();
 
-            // Record the assistant response in conversation history.
+            // Preserve assistant response.
             paramsBuilder.addMessage(message);
 
             var toolCalls = message.toolCalls().orElse(List.of());
 
-            // No tool calls: this is the final response.
+            // Model finished.
             if (toolCalls.isEmpty()) {
                 System.out.print(message.content().orElse(""));
                 return;
             }
 
-            // Execute every tool call returned in this response.
+            // Execute requested tools.
             for (var toolCall : toolCalls) {
 
                 var function = toolCall.function();
+
                 String toolName = function.name();
 
-                if (!"Read".equals(toolName)) {
-                    throw new IllegalArgumentException(
-                            "Unknown tool: " + toolName);
-                }
-
-                // Parse arguments.
-                JsonNode arguments = MAPPER.readTree(
+                String result = executeTool(
+                        toolName,
                         function.arguments());
 
-                JsonNode filePathNode = arguments.get("file_path");
-
-                if (filePathNode == null ||
-                        !filePathNode.isTextual()) {
-                    throw new IllegalArgumentException(
-                            "Missing or invalid file_path argument");
-                }
-
-                String filePath = filePathNode.asText();
-
-                // Execute Read tool.
-                String result = Files.readString(
-                        Path.of(filePath));
-
-                // Send tool result back to the model.
+                // Return tool result to the model.
                 paramsBuilder.addMessage(
                         ChatCompletionToolMessageParam.builder()
                                 .toolCallId(toolCall.id())
                                 .content(result)
                                 .build());
             }
-
-            // Continue loop.
-            // The model receives the tool results in the next request.
         }
     }
 }
