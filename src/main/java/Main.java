@@ -1,255 +1,279 @@
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
-import com.openai.core.JsonValue;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
-import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 public class Main {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Path SKILLS_DIR = Path.of(".claude", "skills");
 
-    // READ TOOL
-    private static Map<String, Object> readTool() {
-        return Map.of(
-                "type", "function",
-                "function", Map.of(
-                        "name", "Read",
-                        "description", "Read and return the contents of a file",
-                        "parameters", Map.of(
-                                "type", "object",
-                                "properties", Map.of(
-                                        "file_path", Map.of(
-                                                "type", "string",
-                                                "description", "The path to the file to read")),
-                                "required", List.of("file_path"))));
+    private record Skill(
+            String name,
+            String description,
+            Path file) {
     }
 
-    // WRITE TOOL
-    private static Map<String, Object> writeTool() {
-        return Map.of(
-                "type", "function",
-                "function", Map.of(
-                        "name", "Write",
-                        "description", "Write content to a file",
-                        "parameters", Map.of(
-                                "type", "object",
-                                "properties", Map.of(
-                                        "file_path", Map.of(
-                                                "type", "string",
-                                                "description", "The path of the file to write to"),
-                                        "content", Map.of(
-                                                "type", "string",
-                                                "description", "The content to write to the file")),
-                                "required", List.of("file_path", "content"))));
-    }
-
-    // BASH TOOL
-    private static Map<String, Object> bashTool() {
-        return Map.of(
-                "type", "function",
-                "function", Map.of(
-                        "name", "Bash",
-                        "description", "Execute a bash command",
-                        "parameters", Map.of(
-                                "type", "object",
-                                "properties", Map.of(
-                                        "command", Map.of(
-                                                "type", "string",
-                                                "description", "The bash command to execute")),
-                                "required", List.of("command"))));
-    }
-
-    // TOOL EXECUTION
-    private static String executeTool(
-            String toolName,
-            String argumentsJson) throws Exception {
-
-        JsonNode arguments = MAPPER.readTree(argumentsJson);
-
-        switch (toolName) {
-
-            case "Read": {
-                JsonNode pathNode = arguments.get("file_path");
-
-                if (pathNode == null || !pathNode.isTextual()) {
-                    throw new IllegalArgumentException(
-                            "Missing or invalid file_path");
-                }
-
-                String filePath = pathNode.asText();
-
-                return Files.readString(Path.of(filePath));
+    public static void main(String[] args) {
+        try {
+            if (args.length < 2 || !"-p".equals(args[0])) {
+                System.err.println("Usage: program -p <prompt>");
+                System.exit(1);
             }
 
-            case "Write": {
-                JsonNode pathNode = arguments.get("file_path");
-                JsonNode contentNode = arguments.get("content");
+            String prompt = args[1];
 
-                if (pathNode == null || !pathNode.isTextual()) {
+            // Discover skills.
+            List<Skill> skills = discoverSkills();
+
+            // Build system instructions containing skill metadata.
+            String systemPrompt = buildSkillsPrompt(skills);
+
+            String userMessage = prompt;
+
+            // Handle slash commands.
+            if (prompt.trim().startsWith("/")) {
+
+                String command = prompt.trim()
+                        .substring(1)
+                        .split("\\s+", 2)[0];
+
+                if (!command.matches("[a-zA-Z0-9_-]+")) {
                     throw new IllegalArgumentException(
-                            "Missing or invalid file_path");
+                            "Invalid skill name: " + command);
                 }
 
-                if (contentNode == null || !contentNode.isTextual()) {
-                    throw new IllegalArgumentException(
-                            "Missing or invalid content");
-                }
+                Skill selected = skills.stream()
+                        .filter(s -> s.name().equals(command))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalArgumentException(
+                                "Skill not found: " + command));
 
-                String filePath = pathNode.asText();
-                String content = contentNode.asText();
+                // Load ONLY the invoked skill's body.
+                String skillContent = Files.readString(selected.file());
 
-                Path path = Path.of(filePath);
+                String skillBody = extractSkillBody(skillContent);
 
-                Path parent = path.toAbsolutePath().getParent();
-
-                if (parent != null) {
-                    Files.createDirectories(parent);
-                }
-
-                // Creates or overwrites the file.
-                Files.writeString(path, content);
-
-                return "File written successfully.";
+                userMessage = skillBody;
             }
 
-            case "Bash": {
-                JsonNode commandNode = arguments.get("command");
+            // OpenRouter configuration.
+            String apiKey = System.getenv("OPENROUTER_API_KEY");
 
-                if (commandNode == null || !commandNode.isTextual()) {
-                    throw new IllegalArgumentException(
-                            "Missing or invalid command");
-                }
+            String baseUrl = System.getenv("OPENROUTER_BASE_URL");
 
-                String command = commandNode.asText();
-
-                ProcessBuilder processBuilder = new ProcessBuilder(
-                        "bash", "-c", command);
-
-                // Combine stdout and stderr.
-                processBuilder.redirectErrorStream(true);
-
-                Process process = processBuilder.start();
-
-                String output;
-
-                // Read command output.
-                try (var input = process.getInputStream()) {
-                    output = new String(
-                            input.readAllBytes(),
-                            StandardCharsets.UTF_8);
-                }
-
-                int exitCode = process.waitFor();
-
-                // Include exit status for the agent.
-                if (exitCode != 0) {
-                    return output
-                            + (output.isEmpty() ? "" : "\n")
-                            + "Command exited with code "
-                            + exitCode;
-                }
-
-                return output;
+            if (apiKey == null || apiKey.isBlank()) {
+                throw new RuntimeException(
+                        "OPENROUTER_API_KEY is not set");
             }
 
-            default:
-                throw new IllegalArgumentException(
-                        "Unknown tool: " + toolName);
-        }
-    }
+            if (baseUrl == null || baseUrl.isBlank()) {
+                baseUrl = "https://openrouter.ai/api/v1";
+            }
 
-    public static void main(String[] args) throws Exception {
+            OpenAIClient client = OpenAIOkHttpClient.builder()
+                    .apiKey(apiKey)
+                    .baseUrl(baseUrl)
+                    .build();
 
-        if (args.length < 2 || !"-p".equals(args[0])) {
-            System.err.println("Usage: program -p <prompt>");
-            System.exit(1);
-        }
+            ChatCompletionCreateParams params = ChatCompletionCreateParams.builder()
+                    .model("anthropic/claude-haiku-4.5")
+                    .addSystemMessage(systemPrompt)
+                    .addUserMessage(userMessage)
+                    .build();
 
-        String prompt = args[1];
-
-        String apiKey = System.getenv("OPENROUTER_API_KEY");
-        String baseUrl = System.getenv("OPENROUTER_BASE_URL");
-
-        if (baseUrl == null || baseUrl.isEmpty()) {
-            baseUrl = "https://openrouter.ai/api/v1";
-        }
-
-        if (apiKey == null || apiKey.isEmpty()) {
-            throw new RuntimeException(
-                    "OPENROUTER_API_KEY is not set");
-        }
-
-        OpenAIClient client = OpenAIOkHttpClient.builder()
-                .apiKey(apiKey)
-                .baseUrl(baseUrl)
-                .build();
-
-        // Advertise all tools.
-        List<Map<String, Object>> tools = List.of(
-                readTool(),
-                writeTool(),
-                bashTool());
-
-        // Initialize conversation.
-        ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
-                .model("anthropic/claude-haiku-4.5")
-                .addUserMessage(prompt)
-                .putAdditionalBodyProperty(
-                        "tools",
-                        JsonValue.from(tools));
-
-        // AGENT LOOP
-        while (true) {
-
-            ChatCompletion response = client.chat().completions().create(
-                    paramsBuilder.build());
+            ChatCompletion response = client.chat().completions().create(params);
 
             if (response.choices().isEmpty()) {
-                throw new RuntimeException("No choices in response");
+                throw new RuntimeException(
+                        "No choices in response");
             }
 
-            var message = response.choices().get(0).message();
+            System.out.print(
+                    response.choices()
+                            .get(0)
+                            .message()
+                            .content()
+                            .orElse(""));
 
-            // Keep assistant response in conversation history.
-            paramsBuilder.addMessage(message);
+        } catch (Exception e) {
+            System.err.println(
+                    "Error: " + e.getMessage());
+            System.exit(1);
+        }
+    }
 
-            var toolCalls = message.toolCalls().orElse(List.of());
+    private static List<Skill> discoverSkills()
+            throws IOException {
 
-            // Final response.
-            if (toolCalls.isEmpty()) {
-                System.out.print(message.content().orElse(""));
-                return;
-            }
+        List<Skill> skills = new ArrayList<>();
 
-            // Execute each requested tool.
-            for (var toolCall : toolCalls) {
+        if (!Files.isDirectory(SKILLS_DIR)) {
+            return skills;
+        }
 
-                var function = toolCall.function();
+        try (Stream<Path> dirs = Files.list(SKILLS_DIR)) {
 
-                String toolName = function.name();
+            dirs.filter(Files::isDirectory)
+                    .sorted(Comparator.comparing(
+                            p -> p.getFileName().toString()))
+                    .forEach(dir -> {
 
-                String result = executeTool(
-                        toolName,
-                        function.arguments());
+                        Path skillFile = dir.resolve("SKILL.md");
 
-                // Append tool result to conversation.
-                paramsBuilder.addMessage(
-                        ChatCompletionToolMessageParam.builder()
-                                .toolCallId(toolCall.id())
-                                .content(result)
-                                .build());
+                        if (!Files.isRegularFile(skillFile)) {
+                            return;
+                        }
+
+                        try {
+                            String content = Files.readString(skillFile);
+
+                            String frontmatter = extractFrontmatter(content);
+
+                            String name = getField(frontmatter, "name");
+
+                            String description = getField(frontmatter, "description");
+
+                            if (name.isBlank()) {
+                                name = dir.getFileName().toString();
+                            }
+
+                            if (!description.isBlank()) {
+                                skills.add(new Skill(
+                                        name,
+                                        description,
+                                        skillFile));
+                            }
+
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+        }
+
+        return skills;
+    }
+
+    private static String buildSkillsPrompt(
+            List<Skill> skills) {
+
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("""
+                You are an AI coding assistant.
+
+                You have access to the following skills.
+                Each skill has a name and a description.
+
+                When the user asks a question or describes a task,
+                identify the skill whose description best matches
+                the requested task.
+
+                Use the skill descriptions to make your decision.
+                Do not claim you lack context when a skill clearly
+                matches the requested task.
+
+                If the user asks which skill matches a task and
+                requests only the skill name, return exactly the
+                matching skill name without additional text,
+                punctuation, or formatting.
+
+                Available skills:
+
+                """);
+
+        for (Skill skill : skills) {
+            sb.append("- ")
+                    .append(skill.name())
+                    .append(": ")
+                    .append(skill.description())
+                    .append("\n");
+        }
+
+        return sb.toString();
+    }
+
+    private static String extractFrontmatter(
+            String content) {
+
+        String normalized = content.replace("\r\n", "\n");
+
+        if (!normalized.startsWith("---\n")) {
+            return "";
+        }
+
+        int closing = normalized.indexOf("\n---", 4);
+
+        if (closing == -1) {
+            return "";
+        }
+
+        return normalized.substring(4, closing);
+    }
+
+    private static String getField(
+            String frontmatter,
+            String field) {
+
+        Pattern pattern = Pattern.compile(
+                "(?m)^" + Pattern.quote(field)
+                        + ":\\s*(.*?)\\s*$");
+
+        Matcher matcher = pattern.matcher(frontmatter);
+
+        if (!matcher.find()) {
+            return "";
+        }
+
+        String value = matcher.group(1).trim();
+
+        if (value.length() >= 2) {
+            if ((value.startsWith("\"")
+                    && value.endsWith("\""))
+                    || (value.startsWith("'")
+                            && value.endsWith("'"))) {
+
+                value = value.substring(
+                        1, value.length() - 1);
             }
         }
+
+        return value;
+    }
+
+    private static String extractSkillBody(
+            String content) {
+
+        String normalized = content.replace("\r\n", "\n");
+
+        if (!normalized.startsWith("---\n")) {
+            return normalized;
+        }
+
+        int closing = normalized.indexOf("\n---", 4);
+
+        if (closing == -1) {
+            throw new IllegalArgumentException(
+                    "Missing closing frontmatter delimiter");
+        }
+
+        int bodyStart = closing + 4;
+
+        if (bodyStart < normalized.length()
+                && normalized.charAt(bodyStart) == '\n') {
+            bodyStart++;
+        }
+
+        return normalized.substring(bodyStart);
     }
 }
