@@ -9,6 +9,7 @@ import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -18,6 +19,7 @@ public class Main {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    // READ TOOL
     private static Map<String, Object> readTool() {
         return Map.of(
                 "type", "function",
@@ -33,6 +35,7 @@ public class Main {
                                 "required", List.of("file_path"))));
     }
 
+    // WRITE TOOL
     private static Map<String, Object> writeTool() {
         return Map.of(
                 "type", "function",
@@ -51,42 +54,62 @@ public class Main {
                                 "required", List.of("file_path", "content"))));
     }
 
+    // BASH TOOL
+    private static Map<String, Object> bashTool() {
+        return Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Bash",
+                        "description", "Execute a bash command",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "command", Map.of(
+                                                "type", "string",
+                                                "description", "The bash command to execute")),
+                                "required", List.of("command"))));
+    }
+
+    // TOOL EXECUTION
     private static String executeTool(
             String toolName,
             String argumentsJson) throws Exception {
 
         JsonNode arguments = MAPPER.readTree(argumentsJson);
 
-        JsonNode pathNode = arguments.get("file_path");
-
-        if (pathNode == null || !pathNode.isTextual()) {
-            throw new IllegalArgumentException(
-                    "Missing or invalid file_path");
-        }
-
-        String filePath = pathNode.asText();
-
-        if (filePath.isBlank()) {
-            throw new IllegalArgumentException("file_path cannot be empty");
-        }
-
-        Path path = Path.of(filePath);
-
         switch (toolName) {
 
             case "Read": {
-                return Files.readString(path);
+                JsonNode pathNode = arguments.get("file_path");
+
+                if (pathNode == null || !pathNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Missing or invalid file_path");
+                }
+
+                String filePath = pathNode.asText();
+
+                return Files.readString(Path.of(filePath));
             }
 
             case "Write": {
+                JsonNode pathNode = arguments.get("file_path");
                 JsonNode contentNode = arguments.get("content");
+
+                if (pathNode == null || !pathNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Missing or invalid file_path");
+                }
 
                 if (contentNode == null || !contentNode.isTextual()) {
                     throw new IllegalArgumentException(
                             "Missing or invalid content");
                 }
 
+                String filePath = pathNode.asText();
                 String content = contentNode.asText();
+
+                Path path = Path.of(filePath);
 
                 Path parent = path.toAbsolutePath().getParent();
 
@@ -94,10 +117,50 @@ public class Main {
                     Files.createDirectories(parent);
                 }
 
-                // Creates the file if missing and overwrites if present.
+                // Creates or overwrites the file.
                 Files.writeString(path, content);
 
                 return "File written successfully.";
+            }
+
+            case "Bash": {
+                JsonNode commandNode = arguments.get("command");
+
+                if (commandNode == null || !commandNode.isTextual()) {
+                    throw new IllegalArgumentException(
+                            "Missing or invalid command");
+                }
+
+                String command = commandNode.asText();
+
+                ProcessBuilder processBuilder = new ProcessBuilder(
+                        "bash", "-c", command);
+
+                // Combine stdout and stderr.
+                processBuilder.redirectErrorStream(true);
+
+                Process process = processBuilder.start();
+
+                String output;
+
+                // Read command output.
+                try (var input = process.getInputStream()) {
+                    output = new String(
+                            input.readAllBytes(),
+                            StandardCharsets.UTF_8);
+                }
+
+                int exitCode = process.waitFor();
+
+                // Include exit status for the agent.
+                if (exitCode != 0) {
+                    return output
+                            + (output.isEmpty() ? "" : "\n")
+                            + "Command exited with code "
+                            + exitCode;
+                }
+
+                return output;
             }
 
             default:
@@ -132,10 +195,13 @@ public class Main {
                 .baseUrl(baseUrl)
                 .build();
 
+        // Advertise all tools.
         List<Map<String, Object>> tools = List.of(
                 readTool(),
-                writeTool());
+                writeTool(),
+                bashTool());
 
+        // Initialize conversation.
         ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
                 .model("anthropic/claude-haiku-4.5")
                 .addUserMessage(prompt)
@@ -143,7 +209,7 @@ public class Main {
                         "tools",
                         JsonValue.from(tools));
 
-        // Agent loop
+        // AGENT LOOP
         while (true) {
 
             ChatCompletion response = client.chat().completions().create(
@@ -155,18 +221,18 @@ public class Main {
 
             var message = response.choices().get(0).message();
 
-            // Preserve assistant response.
+            // Keep assistant response in conversation history.
             paramsBuilder.addMessage(message);
 
             var toolCalls = message.toolCalls().orElse(List.of());
 
-            // Model finished.
+            // Final response.
             if (toolCalls.isEmpty()) {
                 System.out.print(message.content().orElse(""));
                 return;
             }
 
-            // Execute requested tools.
+            // Execute each requested tool.
             for (var toolCall : toolCalls) {
 
                 var function = toolCall.function();
@@ -177,7 +243,7 @@ public class Main {
                         toolName,
                         function.arguments());
 
-                // Return tool result to the model.
+                // Append tool result to conversation.
                 paramsBuilder.addMessage(
                         ChatCompletionToolMessageParam.builder()
                                 .toolCallId(toolCall.id())
